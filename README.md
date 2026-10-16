@@ -1,3 +1,5 @@
+This is A Project Design for Course CPE029/030 in Technological Institute of the Philippines by Group 24
+
 # Duck Egg Inspector
 
 Touchscreen app for the duck egg micro-fissure inspection + UV-C station (Raspberry Pi 5).
