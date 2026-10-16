@@ -8,6 +8,7 @@ import time
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
+from .backend_base import Progress
 from .config import Config
 from .datatypes import EggResult
 
@@ -76,6 +77,8 @@ class MockBackend:
         self.rng = np.random.default_rng(seed)
         self.door_closed = True
         self.leds: set[int] = set()
+        self.slot = 0                                    # holder at the camera
+        self.max_slot = 0                                # furthest holder reached (tests check it stays < egg_count)
 
     def prepare(self) -> None:
         log.info("Mock backend ready")
@@ -86,10 +89,25 @@ class MockBackend:
     def enclosure_closed(self) -> bool:
         return self.door_closed
 
-    def inspect_egg(self, index: int, stop: threading.Event) -> EggResult | None:
+    def home_tray(self, stop: threading.Event) -> bool:
+        if stop.wait(0.05 * self.slot * self.cfg.time_scale):      # reverse, slot by slot
+            return False
+        self.slot = 0
+        return True
+
+    def inspect_egg(self, index: int, stop: threading.Event, progress: Progress) -> EggResult | None:
         t0 = time.perf_counter()
-        if stop.wait(0.9 * self.cfg.time_scale):       # stands in for rotate + capture + inference
+        egg = f"Egg {index + 1}/{self.cfg.egg_count}"
+        n = self.cfg.frames_per_egg
+        progress(f"{egg}: moving tray")
+        if stop.wait(0.2 * self.cfg.time_scale):
             return None
+        self.slot = index
+        self.max_slot = max(self.max_slot, index)
+        for k in range(n):                               # stands in for spin step + capture + inference
+            progress(f"{egg}: capturing view {k + 1}/{n}")
+            if stop.wait(0.7 / n * self.cfg.time_scale):
+                return None
         defective = bool(self.rng.random() < 0.3)
         crack = _crack_path(self.rng) if defective else None
         optical = _optical(self.rng, crack)
@@ -102,6 +120,8 @@ class MockBackend:
             thermal=_thermal(crack),
             heatmap=_overlay(optical, crack) if defective else None,
             latency_ms=(time.perf_counter() - t0) * 1000,
+            views=n,
+            angle_deg=float(self.rng.integers(n)) * 360 / n,   # view where the crack faced the camera
         )
 
     def set_defect_led(self, index: int, on: bool) -> None:

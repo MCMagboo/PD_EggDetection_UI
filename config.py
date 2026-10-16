@@ -8,6 +8,11 @@ class Config:
     uvc_seconds: int = 30             # UV-C exposure per run (Figure 2-11)
     auto_uvc: bool = True             # start UV-C automatically when cracked eggs are found (operator can toggle)
     detect_threshold: float = 0.18    # SOLOv2 validation-calibrated threshold (Table 2-4)
+    frames_per_egg: int = 8           # views captured per 360 deg egg spin (8 = every 45 deg)
+    spin_seconds: float = 4.0         # time for the spin motor to turn an egg one full revolution (calibrate; depends on gear ratio)
+    settle_seconds: float = 0.15      # pause after each spin step so the photo is not motion-blurred
+    tray_move_timeout: float = 5.0    # max seconds to reach the next holder before reporting a fault
+    tray_home_timeout: float = 30.0   # max seconds to reverse back to holder 1 before reporting a fault
     screen_w: int = 800               # used only in windowed mode; fullscreen reads the real screen
     screen_h: int = 480
     fullscreen: bool = True
@@ -18,7 +23,11 @@ class Config:
 PINS = {
     "backlight": 5,            # LED transillumination array (via driver/relay)
     "uvc_relay": 6,            # UV-C module (optocoupler relay)
-    "tray_motor": 13,          # rotary tray motor relay
+    "tray_motor_fwd": 13,      # centre-shaft motor, forward input (H-bridge): next holder to the camera
+    "tray_motor_rev": 16,      # centre-shaft motor, reverse input: return to holder 1 (unwinds the wiring)
+    "tray_home": 20,           # home sensor; pressed = holder 1 at the camera
+    "tray_slot": 21,           # slot sensor; pressed = a holder is aligned with the camera / spin gear
+    "spin_motor": 12,          # motor by the camera stand: meshes with the holder gear, spins the egg 360 deg
     "buzzer": 19,              # 70-85 dB alert
     "door_switch": 26,         # enclosure interlock; pressed = door closed
     "defect_leds": [2, 3, 4, 14, 15, 17, 18, 22, 23, 24],  # one per tray slot

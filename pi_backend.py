@@ -1,6 +1,18 @@
 """Real Raspberry Pi 5 backend. Fill in the NotImplementedError spots once the
 model is trained and the wiring is final. Everything else (UI, flow, safety
-logic) already works through the Backend contract.
+logic, the per-egg spin + capture sequence) already works through the Backend contract.
+
+Mechanism: eggs stand upright in 10 geared holders on a rotating tray (centre shaft =
+tray_motor). A separate spin motor beside the camera stand meshes with the gear of
+whichever holder is at the camera station and turns that egg about its vertical axis.
+
+Per egg: tray motor brings the holder to the fixed camera (gears must line up) -> spin
+motor turns the egg 360 deg in `frames_per_egg` steps (stop, settle, capture) -> model
+scores every view -> the egg is defective if ANY view scores >= detect_threshold.
+The two motors never run together: spinning while the tray moves would grind the gears.
+
+Tray direction: forward only during a batch (holder 1 -> 10); afterwards it reverses to
+holder 1, so it never turns a full revolution one way and the tray wiring cannot wind up.
 """
 from __future__ import annotations
 
@@ -9,19 +21,26 @@ import time
 
 from PIL import Image
 
+from .backend_base import Progress
 from .config import PINS, Config
 from .datatypes import EggResult
+
+View = tuple[Image.Image, Image.Image]      # (optical, thermal) captured at one spin angle
 
 
 class PiBackend:
     def __init__(self, cfg: Config):
-        from gpiozero import LED, Button, Buzzer, OutputDevice   # imported here so the mock runs anywhere
+        from gpiozero import LED, Button, Buzzer, Motor, OutputDevice   # imported here so the mock runs anywhere
         from picamera2 import Picamera2
 
         self.cfg = cfg
         self.backlight = OutputDevice(PINS["backlight"])
         self.uvc_relay = OutputDevice(PINS["uvc_relay"])
-        self.motor = OutputDevice(PINS["tray_motor"])
+        self.tray_motor = Motor(forward=PINS["tray_motor_fwd"], backward=PINS["tray_motor_rev"], pwm=False)
+        self.tray_home = Button(PINS["tray_home"], pull_up=True)   # pressed = holder 1 at the camera
+        self.tray_slot = Button(PINS["tray_slot"], pull_up=True)   # pressed = a holder aligned at the camera
+        self.slot: int | None = None                               # holder at the camera; None until homed
+        self.spin_motor = OutputDevice(PINS["spin_motor"])
         self.buzzer = Buzzer(PINS["buzzer"])
         self.door = Button(PINS["door_switch"], pull_up=True)     # pressed = door closed (check your switch)
         self.defect_leds = [LED(p) for p in PINS["defect_leds"]]
@@ -46,31 +65,114 @@ class PiBackend:
     def enclosure_closed(self) -> bool:
         return self.door.is_pressed
 
+    # ---- tray ------------------------------------------------------------
+    def home_tray(self, stop: threading.Event) -> bool:
+        """Reverse until holder 1 is at the camera. Always backwards: the tray only ever got
+        here by moving forward from holder 1, so reversing unwinds the wiring."""
+        if not self.tray_home.is_pressed and not self._run_tray(
+                self.tray_motor.backward, [lambda: self.tray_home.is_pressed], stop,
+                self.cfg.tray_home_timeout, "home sensor"):
+            return False
+        self.slot = 0
+        return True
+
+    def _index_tray(self, index: int, stop: threading.Event) -> bool:
+        """Move forward, one holder at a time, until holder `index` is aligned with the camera."""
+        if self.slot is None:
+            raise RuntimeError("Tray position unknown; home the tray first")
+        if index < self.slot:
+            raise RuntimeError(f"Tray only moves forward during a batch (at holder {self.slot + 1}, "
+                               f"asked for {index + 1}); home it first")
+        while self.slot < index:
+            # one motor run per holder: leave the current holder's mark, then stop on the next one
+            if not self._run_tray(self.tray_motor.forward,
+                                  [lambda: not self.tray_slot.is_pressed, lambda: self.tray_slot.is_pressed],
+                                  stop, self.cfg.tray_move_timeout, "next holder"):
+                return False
+            self.slot += 1
+        return True
+
+    def _run_tray(self, direction, until, stop: threading.Event, timeout: float, what: str) -> bool:
+        """Run the tray motor until each condition in `until` has become true in turn.
+        Returns False on Stop (position then unknown, so the next Start homes first)."""
+        end = time.monotonic() + timeout
+        direction()
+        try:
+            for done in until:
+                while not done():
+                    if stop.wait(0.005):
+                        self.slot = None
+                        return False
+                    if time.monotonic() > end:
+                        self.slot = None
+                        raise RuntimeError(f"Tray did not reach the {what} within {timeout:g} s. "
+                                           "Check the tray motor and sensor.")
+        finally:
+            self.tray_motor.stop()
+        return True
+
     # ---- inspection ------------------------------------------------------
-    def inspect_egg(self, index: int, stop: threading.Event) -> EggResult | None:
+    def inspect_egg(self, index: int, stop: threading.Event, progress: Progress) -> EggResult | None:
         t0 = time.perf_counter()
+        egg = f"Egg {index + 1}/{self.cfg.egg_count}"
         self.backlight.on()
-        if not self._rotate_to(index, stop):
+        progress(f"{egg}: moving tray")
+        if not self._index_tray(index, stop):
             return None
-        optical = Image.fromarray(self.cam.capture_array()[..., ::-1])   # Picamera2 "RGB888" is BGR order
-        thermal = self._thermal_frame()
-        score, defective = self._predict(optical)
+        views = self._spin_and_capture(egg, stop, progress)
+        if views is None:
+            return None
+        scores = []
+        for k, (optical, _) in enumerate(views):
+            if stop.is_set():
+                return None
+            progress(f"{egg}: analysing view {k + 1}/{len(views)}")
+            scores.append(self._predict(optical))
+        best = max(range(len(views)), key=scores.__getitem__)
+        score = scores[best]
+        defective = score >= self.cfg.detect_threshold
+        optical, thermal = views[best]
         heatmap = self._explain(optical) if defective else None
-        return EggResult(index, defective, score if defective else 1 - score,
-                         optical, thermal, heatmap, (time.perf_counter() - t0) * 1000)
+        return EggResult(index, defective, score if defective else 1 - score, optical, thermal, heatmap,
+                         (time.perf_counter() - t0) * 1000, views=len(views),
+                         angle_deg=best * 360 / len(views))
+
+    def _spin_and_capture(self, egg: str, stop: threading.Event, progress: Progress) -> list[View] | None:
+        """One full turn in equal steps; capture while the egg is still (no motion blur)."""
+        n = self.cfg.frames_per_egg
+        views: list[View] = []
+        for k in range(n):
+            if k and not self._spin_step(stop):
+                return None
+            progress(f"{egg}: capturing view {k + 1}/{n}")
+            views.append((self._optical_frame(), self._thermal_frame()))
+        return views
+
+    def _spin_step(self, stop: threading.Event) -> bool:
+        """Turn the egg 1/frames_per_egg of a revolution, then let it settle.
+        Time-based for a DC motor on a relay; with a stepper, drive a fixed step count here instead."""
+        if self.tray_motor.is_active:
+            raise RuntimeError("Tray motor still running; refusing to spin (gears would grind)")
+        self.spin_motor.on()
+        try:
+            if stop.wait(self.cfg.spin_seconds / self.cfg.frames_per_egg):
+                return False
+        finally:
+            self.spin_motor.off()
+        return not stop.wait(self.cfg.settle_seconds)
+
+    def _optical_frame(self) -> Image.Image:
+        return Image.fromarray(self.cam.capture_array()[..., ::-1])   # Picamera2 "RGB888" is BGR order
 
     # ---- the pieces you still have to write ------------------------------
     def _load_model(self):
         raise NotImplementedError("Load the trained SOLOv2 weights (PyTorch) here")
 
-    def _rotate_to(self, index: int, stop: threading.Event) -> bool:
-        raise NotImplementedError("Drive the rotary tray to slot `index`; do a 360 deg spin; return False if stop is set")
-
     def _thermal_frame(self) -> Image.Image:
         raise NotImplementedError("Grab a frame from the infrared/thermal camera")
 
-    def _predict(self, optical: Image.Image) -> tuple[float, bool]:
-        raise NotImplementedError("Run SOLOv2; return (max crack score, score >= cfg.detect_threshold)")
+    def _predict(self, optical: Image.Image) -> float:
+        raise NotImplementedError("Run SOLOv2 on one view; return its max crack score (0..1)")
 
     def _explain(self, optical: Image.Image) -> Image.Image:
         raise NotImplementedError("XGrad-CAM on ResNet-50 Layer 3 (1024x64x64), upsample, overlay on `optical`")
@@ -91,5 +193,6 @@ class PiBackend:
 
     def safe_off(self) -> None:
         self.uvc_relay.off()
-        self.motor.off()
+        self.tray_motor.stop()
+        self.spin_motor.off()
         self.buzzer.off()

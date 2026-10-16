@@ -76,16 +76,24 @@ class InspectionController:
         if not self.backend.eggs_loaded():
             self._emit("error", "No eggs detected. Load the tray and press Start.")
             return
+        self._emit("status", "Homing tray")
+        if not self.backend.home_tray(self._stop):     # left mid-way by an earlier Stop or fault
+            self._emit("stopped")
+            return
         t0 = time.perf_counter()
         flagged = self._inspect_all()
         if flagged is None:
             self._emit("stopped")
             return
         inspection_s = time.perf_counter() - t0
+        self._emit("status", "Returning tray to holder 1")
+        if not self.backend.home_tray(self._stop):     # reverse, so the tray wiring unwinds
+            self._emit("stopped")
+            return
         if not flagged:
             outcome = UvcOutcome("skipped", "No cracks found, so UV-C was not needed.")
         elif not self.auto_uvc:
-            outcome = UvcOutcome("skipped", "Auto UV-C is off. Tap RUN UV-C to disinfect.")
+            outcome = UvcOutcome("skipped", "Auto UV-C is off. Tap Run UV-C to disinfect.")
         else:
             self._emit("status", "Cracks found: starting UV-C")
             outcome = self._run_uvc()
@@ -100,7 +108,7 @@ class InspectionController:
         total = self.cfg.egg_count
         for i in range(total):
             self._emit("status", f"Inspecting egg {i + 1}/{total}")
-            result = self.backend.inspect_egg(i, self._stop)
+            result = self.backend.inspect_egg(i, self._stop, lambda text: self._emit("status", text))
             if result is None:
                 return None
             self._emit("egg", result)

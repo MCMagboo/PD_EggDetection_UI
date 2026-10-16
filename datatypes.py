@@ -11,10 +11,12 @@ class EggResult:
     index: int                      # 0-based tray slot
     defective: bool
     confidence: float               # 0..1, confidence in the decision shown (crack or no crack)
-    optical: Image.Image
-    thermal: Image.Image
+    optical: Image.Image            # the view with the highest crack score
+    thermal: Image.Image            # infrared frame taken at the same angle
     heatmap: Image.Image | None     # XGrad-CAM overlay, only produced for defects
     latency_ms: float
+    views: int = 1                  # how many angles were captured during the 360 deg spin
+    angle_deg: float = 0.0          # spin angle of the view shown above
 
 
 @dataclass
