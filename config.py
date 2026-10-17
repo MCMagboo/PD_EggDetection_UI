@@ -32,3 +32,12 @@ PINS = {
     "door_switch": 26,         # enclosure interlock; pressed = door closed
     "defect_leds": [2, 3, 4, 14, 15, 17, 18, 22, 23, 24],  # one per tray slot
 }
+
+# How the relay/driver boards switch. CHECK BEFORE POWERING THE UV-C LAMP: many cheap relay
+# modules are active-LOW (input pulled low = relay ON). With the wrong setting, "off" is "on".
+# True = pin HIGH turns the device on; False = pin LOW turns it on.
+ACTIVE_HIGH = {
+    "backlight": True,
+    "uvc_relay": True,
+    "spin_motor": True,
+}

@@ -22,7 +22,7 @@ import time
 from PIL import Image
 
 from .backend_base import Progress
-from .config import PINS, Config
+from .config import ACTIVE_HIGH, PINS, Config
 from .datatypes import EggResult
 
 View = tuple[Image.Image, Image.Image]      # (optical, thermal) captured at one spin angle
@@ -31,22 +31,29 @@ View = tuple[Image.Image, Image.Image]      # (optical, thermal) captured at one
 class PiBackend:
     def __init__(self, cfg: Config):
         from gpiozero import LED, Button, Buzzer, Motor, OutputDevice   # imported here so the mock runs anywhere
-        from picamera2 import Picamera2
+
+        def relay(name: str) -> OutputDevice:                      # starts OFF whichever way the board switches
+            return OutputDevice(PINS[name], active_high=ACTIVE_HIGH[name], initial_value=False)
 
         self.cfg = cfg
-        self.backlight = OutputDevice(PINS["backlight"])
-        self.uvc_relay = OutputDevice(PINS["uvc_relay"])
+        self.backlight = relay("backlight")
+        self.uvc_relay = relay("uvc_relay")
+        self.spin_motor = relay("spin_motor")
         self.tray_motor = Motor(forward=PINS["tray_motor_fwd"], backward=PINS["tray_motor_rev"], pwm=False)
         self.tray_home = Button(PINS["tray_home"], pull_up=True)   # pressed = holder 1 at the camera
         self.tray_slot = Button(PINS["tray_slot"], pull_up=True)   # pressed = a holder aligned at the camera
         self.slot: int | None = None                               # holder at the camera; None until homed
-        self.spin_motor = OutputDevice(PINS["spin_motor"])
         self.buzzer = Buzzer(PINS["buzzer"])
         self.door = Button(PINS["door_switch"], pull_up=True)     # pressed = door closed (check your switch)
         self.defect_leds = [LED(p) for p in PINS["defect_leds"]]
+        self.model = None
+        self._init_camera()
+
+    def _init_camera(self) -> None:
+        from picamera2 import Picamera2
+
         self.cam = Picamera2(0)
         self.cam.configure(self.cam.create_still_configuration(main={"size": (1640, 1232), "format": "RGB888"}))
-        self.model = None
 
     # ---- lifecycle -------------------------------------------------------
     def prepare(self) -> None:
@@ -196,3 +203,48 @@ class PiBackend:
         self.tray_motor.stop()
         self.spin_motor.off()
         self.buzzer.off()
+
+
+class FakeVisionPiBackend(PiBackend):
+    """Hardware bring-up: real motors, sensors, LEDs, buzzer and UV-C, but synthetic images and
+    scores instead of the camera and model (about 1 view in 25 shows a crack)."""
+
+    def _init_camera(self) -> None:
+        import numpy as np
+
+        self.cam = None
+        self._rng = np.random.default_rng()
+        self._cracks: dict[int, object] = {}       # id(optical image) -> crack path or None
+
+    def prepare(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.safe_off()
+        self.backlight.off()
+
+    def inspect_egg(self, index: int, stop: threading.Event, progress: Progress) -> EggResult | None:
+        self._cracks.clear()
+        return super().inspect_egg(index, stop, progress)
+
+    def _optical_frame(self) -> Image.Image:
+        from .mock_backend import _crack_path, _optical
+
+        crack = _crack_path(self._rng) if self._rng.random() < 0.04 else None
+        img = _optical(self._rng, crack)
+        self._cracks[id(img)] = crack
+        return img
+
+    def _thermal_frame(self) -> Image.Image:
+        from .mock_backend import _thermal
+
+        return _thermal(None)
+
+    def _predict(self, optical: Image.Image) -> float:
+        cracked = self._cracks.get(id(optical)) is not None
+        return float(self._rng.uniform(0.3, 0.9) if cracked else self._rng.uniform(0.0, 0.1))
+
+    def _explain(self, optical: Image.Image) -> Image.Image:
+        from .mock_backend import _overlay
+
+        return _overlay(optical, self._cracks.get(id(optical)))
